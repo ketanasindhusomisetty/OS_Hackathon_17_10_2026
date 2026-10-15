@@ -53,7 +53,7 @@ check "Missing command returns status 127" \
     "$([[ $status -eq 127 ]] && echo true || echo false)"
 
 check "Missing command reports execution error" \
-    "$(grep -q 'execvp:' <<< "$output" && echo true || echo false)"
+    "$(grep -q 'Cannot execute' <<< "$output" && echo true || echo false)"
 
 # Summary
 echo
