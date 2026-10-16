@@ -1,9 +1,7 @@
-
-#define _GNU_SOURCE
-
 #include "profiler.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,10 +30,29 @@ int profile_command(char *const argv[], ProfileResult *result)
 
     memset(result, 0, sizeof(*result));
 
+    int error_pipe[2];
+
+    if (pipe(error_pipe) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    int flags = fcntl(error_pipe[1], F_GETFD);
+
+    if (flags == -1 ||
+        fcntl(error_pipe[1], F_SETFD, flags | FD_CLOEXEC) == -1) {
+        perror("fcntl");
+        close(error_pipe[0]);
+        close(error_pipe[1]);
+        return -1;
+    }
+
     struct timespec start, end;
 
     if (clock_gettime(CLOCK_MONOTONIC, &start) == -1) {
         perror("clock_gettime");
+        close(error_pipe[0]);
+        close(error_pipe[1]);
         return -1;
     }
 
@@ -43,14 +60,51 @@ int profile_command(char *const argv[], ProfileResult *result)
 
     if (pid == -1) {
         perror("fork");
+        close(error_pipe[0]);
+        close(error_pipe[1]);
         return -1;
     }
 
     if (pid == 0) {
+        close(error_pipe[0]);
+
         execvp(argv[0], argv);
-        perror("execvp");
+
+        int exec_error = errno;
+        ssize_t written;
+
+        do {
+            written = write(error_pipe[1], &exec_error,
+                            sizeof(exec_error));
+        } while (written == -1 && errno == EINTR);
+
         _exit(127);
     }
+
+    close(error_pipe[1]);
+
+    int exec_error = 0;
+    size_t received = 0;
+    int read_failed = 0;
+    char *error_bytes = (char *)&exec_error;
+
+    while (received < sizeof(exec_error)) {
+        ssize_t n = read(error_pipe[0],
+                         error_bytes + received,
+                         sizeof(exec_error) - received);
+
+        if (n > 0) {
+            received += (size_t)n;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            perror("read");
+            read_failed = 1;
+            break;
+        }
+    }
+
+    close(error_pipe[0]);
 
     int status;
     struct rusage usage;
@@ -65,6 +119,10 @@ int profile_command(char *const argv[], ProfileResult *result)
         return -1;
     }
 
+    if (read_failed) {
+        return -1;
+    }
+
     if (clock_gettime(CLOCK_MONOTONIC, &end) == -1) {
         perror("clock_gettime");
         return -1;
@@ -73,13 +131,23 @@ int profile_command(char *const argv[], ProfileResult *result)
     result->elapsed_seconds = seconds_between(start, end);
     result->user_cpu_seconds = timeval_seconds(usage.ru_utime);
     result->system_cpu_seconds = timeval_seconds(usage.ru_stime);
-
-    /* Linux reports ru_maxrss in kilobytes. */
     result->peak_memory_kb = usage.ru_maxrss;
     result->minor_page_faults = usage.ru_minflt;
     result->major_page_faults = usage.ru_majflt;
     result->voluntary_context_switches = usage.ru_nvcsw;
     result->involuntary_context_switches = usage.ru_nivcsw;
+
+    if (received == sizeof(exec_error)) {
+        fprintf(stderr, "Cannot execute '%s': %s\n",
+                argv[0], strerror(exec_error));
+        result->exit_status = 127;
+        return 1;
+    }
+
+    if (received != 0) {
+        fprintf(stderr, "Error: incomplete execution error message.\n");
+        return -1;
+    }
 
     if (WIFEXITED(status)) {
         result->exit_status = WEXITSTATUS(status);
@@ -117,7 +185,7 @@ void print_profile(const ProfileResult *result)
     if (result->exit_status == 0) {
         printf("Result: Command completed successfully.\n");
     } else {
-        printf("Result: Command failed or was terminated.\n");
+        printf("Result: Command exited unsuccessfully or was terminated.\n");
     }
 
     printf("=====================================\n");
@@ -134,12 +202,18 @@ int main(int argc, char *argv[])
     }
 
     ProfileResult result;
+    int profile_status = profile_command(&argv[1], &result);
 
-    if (profile_command(&argv[1], &result) == -1) {
+    if (profile_status == -1) {
         return 1;
     }
 
-    print_profile(&result);
+    if (profile_status == 1) {
+        /* execvp failed: report the startup error without a
+           misleading command-execution profile. */
+        return 127;
+    }
 
+    print_profile(&result);
     return result.exit_status;
 }
